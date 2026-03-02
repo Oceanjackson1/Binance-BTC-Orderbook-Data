@@ -1,0 +1,8 @@
+# Symbols to collect order book data for.
+# Add more symbols here when expanding — no code changes needed.
+
+spot:
+  - BTCUSDT
+
+futures:
+  - BTCUSDT
