@@ -1,15 +1,98 @@
 services:
   timescaledb:
     image: timescale/timescaledb:latest-pg16
+    restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: password
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
       POSTGRES_DB: orderbook
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - timescale_data:/var/lib/postgresql/data
-      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d orderbook"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  collector:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      TIMESCALE_DSN: postgresql://postgres:${POSTGRES_PASSWORD:-password}@timescaledb:5432/orderbook
+      DATA_DIR: /app/data
+    command: python -m src.main
+    volumes:
+      - orderbook_data:/app/data
+      - ./config:/app/config:ro
+
+  materialize:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      TIMESCALE_DSN: postgresql://postgres:${POSTGRES_PASSWORD:-password}@timescaledb:5432/orderbook
+      DATA_DIR: /app/data
+      PUBLISH_DIR: /app/publish
+    command: python -m src.publish.materializer
+    volumes:
+      - orderbook_data:/app/data:ro
+      - orderbook_publish:/app/publish
+
+  api:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      materialize:
+        condition: service_started
+    env_file:
+      - .env
+    environment:
+      ORDERBOOK_API_DSN: postgresql://postgres:${POSTGRES_PASSWORD:-password}@timescaledb:5432/orderbook
+      PUBLISH_DIR: /app/publish
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+    command: uvicorn src.api.main:app --host 0.0.0.0 --port 8000
+    volumes:
+      - orderbook_publish:/app/publish:ro
+    ports:
+      - "127.0.0.1:${API_PORT:-18080}:8000"
+
+  backup:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      materialize:
+        condition: service_started
+    env_file:
+      - .env
+    environment:
+      TIMESCALE_DSN: postgresql://postgres:${POSTGRES_PASSWORD:-password}@timescaledb:5432/orderbook
+      PUBLISH_DIR: /app/publish
+      BACKUP_DIR: /app/backups/db
+      BACKUP_STATE_DIR: /app/backups/state
+    command: python scripts/backup_manager.py
+    volumes:
+      - orderbook_publish:/app/publish:ro
+      - orderbook_backups:/app/backups
 
 volumes:
   timescale_data:
+  orderbook_data:
+  orderbook_publish:
+  orderbook_backups:

@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 
 from src.collector.spot_collector import SpotCollector
 from src.collector.futures_collector import FuturesCollector
+from src.event_fanout import EventFanout
 from src.writer.parquet_writer import ParquetWriter
 from src.writer.timescale_writer import TimescaleWriter
 
@@ -57,49 +58,66 @@ async def main() -> None:
         futures_symbols,
     )
 
-    # --- Shared event queue (collector → writers) ---
-    # maxsize guards against unbounded memory growth if writers fall behind.
-    # At 10 events/s per symbol × 2 symbols the queue holds ~8 min of data.
-    event_queue: asyncio.Queue = asyncio.Queue(maxsize=50_000)
+    # Collectors publish into one queue, then EventFanout duplicates every
+    # message into a dedicated queue per writer.
+    ingest_queue: asyncio.Queue = asyncio.Queue(maxsize=50_000)
+    parquet_queue: asyncio.Queue = asyncio.Queue(maxsize=50_000)
+    db_queue: asyncio.Queue = asyncio.Queue(maxsize=50_000)
 
     # --- Build collectors ---
     collectors = []
     for sym in spot_symbols:
-        collectors.append(SpotCollector(symbol=sym, event_queue=event_queue))
+        collectors.append(SpotCollector(symbol=sym, event_queue=ingest_queue))
     for sym in futures_symbols:
-        collectors.append(FuturesCollector(symbol=sym, event_queue=event_queue))
+        collectors.append(FuturesCollector(symbol=sym, event_queue=ingest_queue))
 
     # --- Build writers ---
     data_dir = Path(os.getenv("DATA_DIR", "./data"))
-    parquet_writer = ParquetWriter(data_dir=data_dir, event_queue=event_queue)
+    parquet_writer = ParquetWriter(data_dir=data_dir, event_queue=parquet_queue)
 
     timescale_dsn = os.getenv("TIMESCALE_DSN")
     timescale_writer = (
-        TimescaleWriter(dsn=timescale_dsn, collectors=collectors)
+        TimescaleWriter(
+            dsn=timescale_dsn,
+            collectors=collectors,
+            event_queue=db_queue,
+        )
         if timescale_dsn
         else None
     )
 
-    if not timescale_dsn:
+    fanout_targets = [parquet_queue]
+    if timescale_writer:
+        fanout_targets.append(db_queue)
+    else:
         log.info("TIMESCALE_DSN not set — running Parquet-only mode.")
 
+    event_fanout = EventFanout(
+        source_queue=ingest_queue,
+        target_queues=fanout_targets,
+    )
+
     # --- Create asyncio tasks ---
-    tasks = []
+    collector_tasks = []
+    service_tasks = []
 
     for collector in collectors:
-        tasks.append(
+        collector_tasks.append(
             asyncio.create_task(
                 collector.run(),
                 name=f"collector-{collector.MARKET}-{collector.symbol}",
             )
         )
 
-    tasks.append(
+    service_tasks.append(
+        asyncio.create_task(event_fanout.run(), name="event-fanout")
+    )
+    service_tasks.append(
         asyncio.create_task(parquet_writer.run(), name="parquet-writer")
     )
 
     if timescale_writer:
-        tasks.append(
+        service_tasks.append(
             asyncio.create_task(timescale_writer.run(), name="timescale-writer")
         )
 
@@ -116,11 +134,11 @@ async def main() -> None:
 
     # Wait until shutdown is requested or a task raises unexpectedly
     done_task = asyncio.create_task(shutdown_event.wait(), name="shutdown-watcher")
-    tasks.append(done_task)
+    all_tasks = collector_tasks + service_tasks + [done_task]
 
     try:
         done, pending = await asyncio.wait(
-            tasks, return_when=asyncio.FIRST_COMPLETED
+            all_tasks, return_when=asyncio.FIRST_COMPLETED
         )
 
         # Log any tasks that finished unexpectedly (before shutdown)
@@ -131,11 +149,34 @@ async def main() -> None:
                     log.error("Task %s raised: %r", t.get_name(), exc)
 
     finally:
-        log.info("Cancelling all tasks…")
-        for t in tasks:
+        log.info("Stopping collectors…")
+        for t in collector_tasks:
             t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        done_task.cancel()
+        await asyncio.gather(*collector_tasks, return_exceptions=True)
+
+        log.info("Waiting for queues to drain…")
+        await _wait_for_queues_to_drain(
+            queues=[ingest_queue, parquet_queue, db_queue],
+            timeout=10,
+        )
+
+        log.info("Cancelling service tasks…")
+        for t in service_tasks:
+            t.cancel()
+        await asyncio.gather(*service_tasks, done_task, return_exceptions=True)
         log.info("All tasks cancelled — exiting.")
+
+
+async def _wait_for_queues_to_drain(
+    queues: list[asyncio.Queue],
+    timeout: float,
+) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        if all(queue.empty() for queue in queues):
+            return
+        await asyncio.sleep(0.25)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,8 @@
 
 同时提供**历史数据批量下载工具**，支持从 Binance 公开数据门户和 CoinGlass API 获取历史成交、深度及市场指标数据。
 
+在实时采集之外，当前仓库还包含一套**可部署的数据发布栈**：可选写入 TimescaleDB、周期性物化 `publish/` 目录、通过 FastAPI 对外提供只读查询 API，并支持 Docker Compose、Nginx 反向代理、腾讯云 COS 备份。
+
 ---
 
 ## 目录
@@ -17,11 +19,13 @@
 7. [实时采集——现货 bookDepth](#7-实时采集现货-bookdepth)
 8. [全部数据字段参考](#8-全部数据字段参考)
 9. [回溯研究使用指南](#9-回溯研究使用指南)
-10. [配置说明](#10-配置说明)
-11. [TimescaleDB 监控（可选）](#11-timescaledb-监控可选)
-12. [系统要求与存储估算](#12-系统要求与存储估算)
-13. [已知限制](#13-已知限制)
-14. [常见问题排查](#14-常见问题排查)
+10. [数据发布与只读 API（可选）](#10-数据发布与只读-api可选)
+11. [Docker Compose / 腾讯云部署（可选）](#11-docker-compose--腾讯云部署可选)
+12. [配置说明](#12-配置说明)
+13. [TimescaleDB 与数据库表（可选）](#13-timescaledb-与数据库表可选)
+14. [系统要求与存储估算](#14-系统要求与存储估算)
+15. [已知限制](#15-已知限制)
+16. [常见问题排查](#16-常见问题排查)
 
 ---
 
@@ -82,14 +86,29 @@
                      └──────────┬──────────────┘
                                 │  maxsize=50,000
                ┌────────────────▼─────────────────┐
-               │          ParquetWriter            │
-               │  快照 → 立即写入                   │
-               │  Diff → 缓冲批量写入（10k条/5min） │
+               │           EventFanout             │
+               │ collector 事件复制到多写入通道      │
                └───────┬────────────────────┬──────┘
                        │                    │
           ┌────────────▼────────┐  ┌────────▼──────────────┐
-          │ snapshots_*.parquet │  │  events_*.parquet      │
-          └─────────────────────┘  └───────────────────────┘
+          │    ParquetWriter    │  │   TimescaleWriter      │
+          │ snapshots/events    │  │ raw + summary + health │
+          └────────────┬────────┘  └────────┬──────────────┘
+                       │                    │
+          ┌────────────▼────────┐  ┌────────▼──────────────┐
+          │ snapshots_*.parquet │  │     TimescaleDB        │
+          │ events_*.parquet    │  │  events/snapshots/...  │
+          └─────────────────────┘  └────────┬──────────────┘
+                                            │
+                                 ┌──────────▼───────────┐
+                                 │ PublishMaterializer  │
+                                 │ raw / curated / meta │
+                                 └──────────┬─────┬─────┘
+                                            │     │
+                           ┌────────────────▼┐ ┌──▼──────────────┐
+                           │   FastAPI API   │ │  BackupManager   │
+                           │ Bearer 只读接口   │ │ COS + DB dump    │
+                           └─────────────────┘ └──────────────────┘
 
   ┌────────────────────────────────────────────────────────────┐
   │              历史数据下载工具（独立运行）                     │
@@ -116,8 +135,13 @@
 | `src/collector/spot_collector.py` | 现货专属端点及同步规则（`U == prev_u+1` 连续性校验） |
 | `src/collector/futures_collector.py` | 合约专属端点及同步规则（`pu == prev_u` 连续性校验） |
 | `src/orderbook/local_book.py` | 基于 `SortedDict` + `Decimal` 的内存 L2 订单簿 |
+| `src/event_fanout.py` | 将采集事件复制到 Parquet / TimescaleDB 等多个下游写入队列 |
 | `src/writer/parquet_writer.py` | Parquet 文件写入，快照立即写、Diff 批量写、原子 rename |
-| `src/writer/timescale_writer.py` | 定期将买一/卖一及健康指标写入 TimescaleDB（可选） |
+| `src/writer/timescale_writer.py` | 写入 TimescaleDB：原始 Diff、完整快照、1 秒摘要、采集器健康状态 |
+| `src/publish/materializer.py` | 周期性生成 `publish/raw`、`publish/curated`、`publish/meta` 发布目录 |
+| `src/api/main.py` | FastAPI 只读 API，提供元数据、聚合数据、原始快照 / 事件查询 |
+| `src/api/security.py` | API 鉴权、中间件限流、内网免鉴权白名单控制 |
+| `scripts/backup_manager.py` | 本地 PostgreSQL dump 轮转，并同步 `publish/` 和备份文件到 COS |
 | `scripts/download_historical.py` | 从 Binance data.binance.vision 批量下载历史数据 (含 klines) |
 | `scripts/download_coinglass_orderbook.py` | 从 CoinGlass API 下载 Order Book 深度历史 |
 | `scripts/collect_spot_bookdepth.py` | 实时采集现货 bookDepth 等价数据（WebSocket + REST） |
@@ -151,7 +175,7 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-### 三种使用模式
+### 四种使用模式
 
 ```bash
 # 模式 1：实时采集 Full L2 Order Book（从现在开始持续运行）
@@ -162,6 +186,9 @@ python scripts/download_historical.py --start 2026-01-01 --end 2026-03-01
 
 # 模式 3：下载 CoinGlass Order Book 深度历史
 python scripts/download_coinglass_orderbook.py --api-key YOUR_KEY
+
+# 模式 4：启动完整发布栈（TimescaleDB + API + 备份）
+docker compose up -d --build
 ```
 
 ---
@@ -390,7 +417,7 @@ timestamp,percentage,depth,notional
 
 ## 8. 全部数据字段参考
 
-### 7.1 实时采集——快照文件（`snapshots_*.parquet`）
+### 8.1 实时采集——快照文件（`snapshots_*.parquet`）
 
 | 字段 | 类型 | 可空 | 说明 |
 |------|------|------|------|
@@ -404,7 +431,7 @@ timestamp,percentage,depth,notional
 | `bids` | list | 否 | 完整买方订单簿 `[["价格", "数量"], ...]`，高价到低价 |
 | `asks` | list | 否 | 完整卖方订单簿 `[["价格", "数量"], ...]`，低价到高价 |
 
-### 7.2 实时采集——增量事件文件（`events_*.parquet`）
+### 8.2 实时采集——增量事件文件（`events_*.parquet`）
 
 | 字段 | 类型 | 可空 | 说明 |
 |------|------|------|------|
@@ -421,7 +448,7 @@ timestamp,percentage,depth,notional
 
 > **关键**: events 只包含**变化的档位**，不是完整订单簿。要重建任意时刻的完整订单簿，需先加载 snapshot，再逐条应用 events。
 
-### 7.3 Binance 历史——合约 aggTrades
+### 8.3 Binance 历史——合约 aggTrades
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
@@ -433,7 +460,7 @@ timestamp,percentage,depth,notional
 | `transact_time` | int | 成交时间（Unix 毫秒） |
 | `is_buyer_maker` | bool | `true` = 卖方主动成交（下行压力）；`false` = 买方主动成交（上行压力） |
 
-### 7.4 Binance 历史——合约 trades
+### 8.4 Binance 历史——合约 trades
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
@@ -444,7 +471,7 @@ timestamp,percentage,depth,notional
 | `time` | int | 成交时间（Unix 毫秒） |
 | `is_buyer_maker` | bool | 同 aggTrades |
 
-### 7.5 Binance 历史——现货 aggTrades
+### 8.5 Binance 历史——现货 aggTrades
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
@@ -457,7 +484,7 @@ timestamp,percentage,depth,notional
 | `is_buyer_maker` | bool | 买方是否为挂单方 |
 | `is_best_match` | bool | 是否为最优价格撮合 |
 
-### 7.6 Binance 历史——现货 trades
+### 8.6 Binance 历史——现货 trades
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
@@ -469,7 +496,7 @@ timestamp,percentage,depth,notional
 | `is_buyer_maker` | bool | 买方是否为挂单方 |
 | `is_best_match` | bool | 是否为最优价格撮合 |
 
-### 7.7 Binance 历史——合约 bookDepth（深度摘要）
+### 8.7 Binance 历史——合约 bookDepth（深度摘要）
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
@@ -480,7 +507,7 @@ timestamp,percentage,depth,notional
 
 > 每条 timestamp 对应 10 行：-5, -4, -3, -2, -1, 1, 2, 3, 4, 5。例：`percentage=-5, depth=6419.548` 表示中间价以下 0-5% 内买方共挂 6419.548 BTC。
 
-### 7.8 Binance 历史——合约 metrics（市场指标）
+### 8.8 Binance 历史——合约 metrics（市场指标）
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
@@ -493,7 +520,7 @@ timestamp,percentage,depth,notional
 | `count_long_short_ratio` | decimal | 全市场多空人数比 |
 | `sum_taker_long_short_vol_ratio` | decimal | 主动买/卖成交量比。>1 多方强，<1 空方强 |
 
-### 7.9 CoinGlass——单交易所 Order Book 深度
+### 8.9 CoinGlass——单交易所 Order Book 深度
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
@@ -505,7 +532,7 @@ timestamp,percentage,depth,notional
 | `asks_usd` | decimal | 该范围内**卖方挂单总金额**（USD） |
 | `asks_quantity` | decimal | 该范围内**卖方挂单总量**（BTC） |
 
-### 7.10 CoinGlass——跨交易所聚合 Order Book 深度
+### 8.10 CoinGlass——跨交易所聚合 Order Book 深度
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
@@ -598,7 +625,118 @@ seed = snaps[snaps["snapshot_time_ns"] <= target_ns].iloc[-1]
 
 ---
 
-## 10. 配置说明
+## 10. 数据发布与只读 API（可选）
+
+当设置 `TIMESCALE_DSN` 并运行 `docker compose up -d --build` 后，仓库会形成一条完整发布链路：
+
+1. `collector` 采集原始订单簿并写入 Parquet 与 TimescaleDB。
+2. `materialize` 周期性读取数据库和已稳定的 Parquet 文件，生成 `publish/raw`、`publish/curated`、`publish/meta`。
+3. `api` 从 `publish/` 和 TimescaleDB 提供只读查询接口。
+4. `backup` 定期生成 PostgreSQL dump，并把 `publish/` 与数据库备份同步到腾讯云 COS。
+
+### 发布目录结构
+
+```
+publish/
+├── raw/           ← 稳定后的原始 parquet 镜像
+├── curated/       ← 聚合后的 JSON 数据集
+└── meta/          ← markets/files/keysets/status 等元信息
+```
+
+### 当前已发布的数据集
+
+| 数据集 | 来源 | 说明 |
+|--------|------|------|
+| `book_snapshots` | `orderbook_snapshots` | 各 timeframe 的买一卖一、中间价、深度摘要 |
+| `price_changes` | `orderbook_snapshots` | timeframe 级别价格变化聚合 |
+| `recovery_events` | `collector_health` | 重连/恢复情况聚合 |
+| `trades` | 预留 | 当前 agent 未发布成交数据，接口会返回空结果 |
+
+### 只读 API 端点
+
+| 路径 | 说明 |
+|------|------|
+| `/health` | 健康检查，不需要鉴权 |
+| `/v1/keysets/index` | 可用分区索引 |
+| `/v1/keysets/{dt}/{timeframe}` | 指定日期 + timeframe 的 keyset manifest |
+| `/v1/meta/markets` | 可用市场 / 品种 |
+| `/v1/meta/files` | 发布文件索引，可按 dataset / dt / timeframe / market 过滤 |
+| `/v1/curated/{dataset}` | 读取聚合后的发布数据 |
+| `/v1/collector-health` | 数据库中的最新采集器状态 |
+| `/v1/orderbook/latest-summary` | 最新 1 条 top-of-book 摘要 |
+| `/v1/orderbook/latest-full-snapshot` | 最新完整订单簿快照 |
+| `/v1/orderbook/snapshots` | 按时间范围查询完整快照 |
+| `/v1/orderbook/events` | 按时间范围查询原始 Diff 事件 |
+
+### 鉴权与访问控制
+
+- `/health` 始终匿名可访问。
+- 其他 `/v1/*` 接口默认要求 `Authorization: Bearer <ORDERBOOK_API_TOKEN>`。
+- 可通过 `ALLOW_PRIVATE_NETWORK_WITHOUT_AUTH=true` + `PRIVATE_ACCESS_CIDRS=...` 允许内网来源免 token。
+- API 文档页（Swagger / OpenAPI）默认关闭，面向生产只读访问。
+
+### 调用示例
+
+```bash
+# 健康检查
+curl http://127.0.0.1:18080/health
+
+# 读取可用市场
+curl -H "Authorization: Bearer $ORDERBOOK_API_TOKEN" \
+  http://127.0.0.1:18080/v1/meta/markets
+
+# 读取 5m 订单簿摘要
+curl -H "Authorization: Bearer $ORDERBOOK_API_TOKEN" \
+  "http://127.0.0.1:18080/v1/curated/book_snapshots?market_slug=spot-btcusdt&timeframe=5m&limit=5"
+
+# 查询最新完整快照
+curl -H "Authorization: Bearer $ORDERBOOK_API_TOKEN" \
+  "http://127.0.0.1:18080/v1/orderbook/latest-full-snapshot?market=spot&symbol=BTCUSDT"
+```
+
+---
+
+## 11. Docker Compose / 腾讯云部署（可选）
+
+仓库当前自带完整容器编排，`docker-compose.yml` 默认会启动以下服务：
+
+| 服务 | 作用 |
+|------|------|
+| `timescaledb` | 保存原始 Diff、完整快照、1 秒摘要和采集器健康状态 |
+| `collector` | 持续采集 Binance Spot / Futures L2 数据 |
+| `materialize` | 生成 `publish/` 发布目录 |
+| `api` | 提供只读查询 API |
+| `backup` | 轮转本地 DB dump，并同步到 COS |
+
+### 本地启动
+
+```bash
+cp .env.example .env
+# 编辑 .env，至少设置 POSTGRES_PASSWORD / ORDERBOOK_API_TOKEN
+
+docker compose up -d --build
+docker compose ps
+docker compose logs -f collector
+```
+
+默认情况下：
+
+- API 暴露在 `127.0.0.1:${API_PORT}`，默认端口 `18080`
+- TimescaleDB 暴露在 `127.0.0.1:5432`
+- 数据卷包括 `timescale_data`、`orderbook_data`、`orderbook_publish`、`orderbook_backups`
+
+### 腾讯云 / Nginx / 飞连相关文档
+
+- [DEPLOY_TENCENT_CLOUD.md](./DEPLOY_TENCENT_CLOUD.md)：腾讯云整体部署流程
+- [TENCENT_CLOUD_SECURITY_GROUP.md](./TENCENT_CLOUD_SECURITY_GROUP.md)：安全组放行规则
+- [FEILIAN_PRIVATE_ACCESS.md](./FEILIAN_PRIVATE_ACCESS.md)：飞连内网免鉴权访问
+- [deploy/install_nginx_proxy.sh](./deploy/install_nginx_proxy.sh)：安装 Nginx 反向代理与自签名证书
+
+如果需要把 API 暴露为 `https://<host>/<agent_id>/v1/...`，建议先跑通本地 `docker compose`，再按上面的文档启用 Nginx 反向代理。
+
+---
+
+## 12. 配置说明
 
 ### `config/symbols.yaml`
 
@@ -617,12 +755,35 @@ futures:
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `DATA_DIR` | `./data` | Parquet 文件输出根目录 |
-| `TIMESCALE_DSN` | （未设置）| TimescaleDB 连接串；未设置则跳过数据库写入 |
+| `PUBLISH_DIR` | `./publish` | 物化后的发布目录根路径 |
+| `TIMESCALE_DSN` | （未设置） | TimescaleDB 连接串；未设置则跳过数据库写入 |
+| `AGENT_ID` | `binance-orderbook` | 发布目录与反向代理路径中的 agent 标识 |
+| `PUBLISH_TIMEFRAMES` | `5m,15m,1h,4h` | 物化输出的聚合周期 |
+| `PUBLISH_LOOKBACK_DAYS` | `2` | 每次物化回看的自然日数量 |
+| `PUBLISH_STABLE_SECONDS` | `120` | Parquet 文件稳定多久后才镜像进 `publish/raw` |
+| `MATERIALIZE_INTERVAL_SECONDS` | `60` | 物化任务轮询间隔 |
+| `ORDERBOOK_API_DSN` | 与 `TIMESCALE_DSN` 相同 | API 查询数据库时使用的连接串 |
+| `API_HOST` | `127.0.0.1` | API 监听地址（本地运行时） |
+| `API_PORT` | `18080` | API 监听端口 |
+| `ORDERBOOK_API_TOKEN` | （必填） | `/v1/*` 接口 Bearer Token |
+| `API_RATE_LIMIT_PER_MINUTE` | `240` | 单 IP 每分钟限流 |
+| `ALLOW_PRIVATE_NETWORK_WITHOUT_AUTH` | `false` | 是否允许内网来源免 token |
+| `PRIVATE_ACCESS_CIDRS` | RFC1918 + loopback | 内网免鉴权的来源网段 |
+| `POSTGRES_PASSWORD` | `password` | Docker Compose 初始化数据库密码 |
+| `TENCENT_COS_BUCKET` | （未设置） | 远程备份桶名 |
+| `TENCENT_COS_REGION` | （未设置） | COS 区域 |
+| `TENCENT_COS_PREFIX` | `agents/binance-orderbook` | 远程对象前缀 |
+| `TENCENTCLOUD_SECRET_ID` | （未设置） | 腾讯云 API 凭证 |
+| `TENCENTCLOUD_SECRET_KEY` | （未设置） | 腾讯云 API 凭证 |
+| `TENCENT_COS_SYNC_INTERVAL_SECONDS` | `30` | 远程同步扫描间隔 |
+| `TENCENT_COS_STABLE_SECONDS` | `10` | 文件稳定多久后允许上传 |
+| `DB_BACKUP_INTERVAL_SECONDS` | `3600` | PostgreSQL dump 周期 |
+| `DB_BACKUP_RETENTION_COUNT` | `48` | 本地保留备份份数 |
 | `LOG_LEVEL` | `INFO` | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR` |
 
 ---
 
-## 11. TimescaleDB 监控（可选）
+## 13. TimescaleDB 与数据库表（可选）
 
 ```bash
 docker compose up -d
@@ -630,16 +791,18 @@ echo "TIMESCALE_DSN=postgresql://postgres:password@localhost:5432/orderbook" >> 
 python -m src.main
 ```
 
-写入两张表：
+当前实现会写入 4 张表：
 
 | 表 | 频率 | 字段 |
 |------|------|------|
+| `orderbook_events_raw` | Diff 批量刷写 | exchange_time, first_update_id, last_update_id, bids, asks |
+| `orderbook_full_snapshots_raw` | 初始快照 + 每小时检查点 | snapshot_time, snapshot_type, bid_count, ask_count, bids, asks |
 | `orderbook_snapshots` | 每 1 秒 | ts, market, symbol, best_bid, best_ask, spread, mid_price, bid_depth_10, ask_depth_10 |
 | `collector_health` | 每 10 秒 | ts, market, symbol, restarts, last_update_id, is_live |
 
 ---
 
-## 12. 系统要求与存储估算
+## 14. 系统要求与存储估算
 
 ### 实时采集
 
@@ -649,6 +812,15 @@ python -m src.main
 | 内存 | 200–400 MB（BTC 现货 + 合约） |
 | 磁盘 | 约 350–650 MB/天 |
 | 网络 | ~500 KB–1 MB/s 入站 |
+
+### Docker 一体化部署建议
+
+| 资源 | 建议 |
+|------|------|
+| CPU | 2 vCPU+ |
+| 内存 | 4 GB+（含 TimescaleDB / API / 备份） |
+| 磁盘 | 100 GB SSD+，按保留天数线性增长 |
+| 网络 | 需访问 Binance、CoinGlass（可选）、腾讯云 COS（可选） |
 
 ### 历史数据（BTC/USDT，59 天示例）
 
@@ -665,7 +837,7 @@ python -m src.main
 
 ---
 
-## 13. 已知限制
+## 15. 已知限制
 
 | 限制 | 说明 |
 |------|------|
@@ -679,7 +851,7 @@ python -m src.main
 
 ---
 
-## 14. 常见问题排查
+## 16. 常见问题排查
 
 | 问题 | 原因 | 解决方案 |
 |------|------|---------|
@@ -698,26 +870,42 @@ python -m src.main
 Binance-BTC-Orderbook-Data/
 ├── src/
 │   ├── main.py                          # 入口：python -m src.main
+│   ├── event_fanout.py                  # 事件复制到多个 writer 队列
 │   ├── collector/
 │   │   ├── base_collector.py            # Binance 7 步同步算法核心
 │   │   ├── spot_collector.py            # 现货：WS + REST + U==prev_u+1 校验
 │   │   └── futures_collector.py         # 合约：WS + REST + pu==prev_u 校验
 │   ├── orderbook/
 │   │   └── local_book.py               # 内存 L2 订单簿（SortedDict + Decimal）
+│   ├── api/
+│   │   ├── main.py                      # FastAPI 只读 API
+│   │   ├── publish_store.py             # 读取 publish/ 元数据与数据集
+│   │   └── security.py                  # Bearer 鉴权 / 限流 / 内网白名单
+│   ├── publish/
+│   │   ├── common.py                    # 发布目录 / timeframe / keyset 公共逻辑
+│   │   └── materializer.py              # 生成 raw / curated / meta 发布产物
 │   └── writer/
 │       ├── parquet_writer.py            # Parquet 输出（快照立即写/事件批量写）
-│       └── timescale_writer.py          # TimescaleDB 输出（可选）
+│       └── timescale_writer.py          # TimescaleDB 输出（raw + summary + health）
 ├── scripts/
 │   ├── download_historical.py           # Binance 历史数据批量下载
 │   ├── download_coinglass_orderbook.py  # CoinGlass Order Book 深度下载
 │   ├── collect_spot_bookdepth.py       # 现货 bookDepth 实时采集（WebSocket）
+│   ├── backup_manager.py                # DB dump 轮转 + COS 同步
 │   ├── generate_sample.py              # 样本采集 + 自动验证
 │   ├── parquet_to_csv.py               # Parquet → CSV 转换
 │   └── init_db.sql                     # TimescaleDB 表结构
 ├── config/
 │   └── symbols.yaml                    # 品种配置（添加品种只改这里）
+├── deploy/
+│   ├── install_nginx_proxy.sh          # Nginx 反向代理安装脚本
+│   └── nginx/binance-orderbook-api.conf.template
+├── Dockerfile                          # 采集 / materialize / api / backup 共用镜像
+├── docker-compose.yml                  # 五服务一体化部署
+├── DEPLOY_TENCENT_CLOUD.md             # 腾讯云部署说明
+├── TENCENT_CLOUD_SECURITY_GROUP.md     # 腾讯云安全组规则
+├── FEILIAN_PRIVATE_ACCESS.md           # 飞连内网免鉴权说明
 ├── .env.example                        # 环境变量模板
-├── docker-compose.yml                  # TimescaleDB 一键启动
 └── requirements.txt                    # Python 依赖
 ```
 
@@ -732,6 +920,9 @@ sortedcontainers>=2.4 # SortedDict（高性能有序字典）
 python-dotenv>=1.0    # .env 文件加载
 pyyaml>=6.0           # YAML 配置解析
 asyncpg>=0.29         # TimescaleDB 异步驱动（可选）
+fastapi>=0.115        # 只读 API
+uvicorn>=0.30         # API 服务启动
+cos-python-sdk-v5     # 腾讯云 COS 备份
 ```
 
 ---
