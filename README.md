@@ -14,13 +14,14 @@
 4. [实时采集——Full L2 Order Book](#4-实时采集full-l2-order-book)
 5. [历史数据下载——Binance 公开数据](#5-历史数据下载binance-公开数据)
 6. [历史数据下载——CoinGlass Order Book 深度](#6-历史数据下载coinglass-order-book-深度)
-7. [全部数据字段参考](#7-全部数据字段参考)
-8. [回溯研究使用指南](#8-回溯研究使用指南)
-9. [配置说明](#9-配置说明)
-10. [TimescaleDB 监控（可选）](#10-timescaledb-监控可选)
-11. [系统要求与存储估算](#11-系统要求与存储估算)
-12. [已知限制](#12-已知限制)
-13. [常见问题排查](#13-常见问题排查)
+7. [实时采集——现货 bookDepth](#7-实时采集现货-bookdepth)
+8. [全部数据字段参考](#8-全部数据字段参考)
+9. [回溯研究使用指南](#9-回溯研究使用指南)
+10. [配置说明](#10-配置说明)
+11. [TimescaleDB 监控（可选）](#11-timescaledb-监控可选)
+12. [系统要求与存储估算](#12-系统要求与存储估算)
+13. [已知限制](#13-已知限制)
+14. [常见问题排查](#14-常见问题排查)
 
 ---
 
@@ -56,6 +57,8 @@
 | **逐笔成交 trades** | Binance 公开数据 | 历史下载 | 每笔撮合记录，含价格/数量/方向 |
 | **聚合成交 aggTrades** | Binance 公开数据 | 历史下载 | 合并同条件 trade，减少数据量 |
 | **合约深度摘要 bookDepth** | Binance 公开数据 | 历史下载 | ±1-5% 累计深度，~30 秒一条 |
+| **现货深度摘要 bookDepth** | Binance WebSocket + REST | 实时采集 | ±1-5% 累计深度，~30 秒一条（自行计算） |
+| **现货 K 线 klines** | Binance 公开数据 | 历史下载 | OHLCV + Taker 买入量，1m/5m/30m/1h |
 | **合约市场指标 metrics** | Binance 公开数据 | 历史下载 | 未平仓量、多空比等，5 分钟一条 |
 | **Order Book 深度历史** | CoinGlass API | 历史下载 | ±1/2/3/5/10% 聚合深度，30 分钟一条，支持跨交易所 |
 
@@ -93,7 +96,10 @@
   │                                                            │
   │  download_historical.py     Binance公开数据门户              │
   │    ├── futures: aggTrades, trades, bookDepth, metrics       │
-  │    └── spot:    aggTrades, trades                           │
+  │    └── spot:    aggTrades, trades, klines (1m/5m/30m/1h)   │
+  │                                                            │
+  │  collect_spot_bookdepth.py    Binance WebSocket + REST     │
+  │    └── 现货 bookDepth 等价数据 (±1~5%, ~30s)                │
   │                                                            │
   │  download_coinglass_orderbook.py    CoinGlass API          │
   │    ├── Binance 合约/现货 Order Book 深度                    │
@@ -112,8 +118,9 @@
 | `src/orderbook/local_book.py` | 基于 `SortedDict` + `Decimal` 的内存 L2 订单簿 |
 | `src/writer/parquet_writer.py` | Parquet 文件写入，快照立即写、Diff 批量写、原子 rename |
 | `src/writer/timescale_writer.py` | 定期将买一/卖一及健康指标写入 TimescaleDB（可选） |
-| `scripts/download_historical.py` | 从 Binance data.binance.vision 批量下载历史数据 |
+| `scripts/download_historical.py` | 从 Binance data.binance.vision 批量下载历史数据 (含 klines) |
 | `scripts/download_coinglass_orderbook.py` | 从 CoinGlass API 下载 Order Book 深度历史 |
+| `scripts/collect_spot_bookdepth.py` | 实时采集现货 bookDepth 等价数据（WebSocket + REST） |
 | `scripts/generate_sample.py` | 采集样本数据并自动验证完整性 |
 | `scripts/parquet_to_csv.py` | 将 Parquet 转为 CSV（展开版） |
 | `scripts/init_db.sql` | TimescaleDB 表结构 |
@@ -229,6 +236,7 @@ futures.BTCUSDT — Emitting initial snapshot  bids=1150  asks=1052
 | `aggTrades` | 现货 + 合约 | 逐笔 | 聚合成交记录：价格、数量、方向 |
 | `trades` | 现货 + 合约 | 逐笔 | 原始成交明细：每笔撮合的完整记录 |
 | `bookDepth` | 合约 | ~30 秒 | 订单簿深度摘要：±1-5% 累计深度和名义价值 |
+| `klines` | 现货 | 1m/5m/30m/1h | K 线数据：OHLCV + 成交笔数 + Taker 买入量 |
 | `metrics` | 合约 | 5 分钟 | 未平仓量、多空比、Taker 买卖量比 |
 
 ### 使用方法
@@ -259,7 +267,12 @@ BTC-Historical-Data/
 └── spot/
     └── BTCUSDT/
         ├── aggTrades/          ← 59 个 zip 文件，约 1.1 GB
-        └── trades/             ← 59 个 zip 文件，约 2.1 GB
+        ├── trades/             ← 59 个 zip 文件，约 2.1 GB
+        ├── klines_1m/          ← 59 个 zip 文件，约 4.3 MB
+        ├── klines_5m/          ← 59 个 zip 文件，约 1.2 MB
+        ├── klines_30m/         ← 59 个 zip 文件，约 472 KB
+        ├── klines_1h/          ← 59 个 zip 文件，约 472 KB
+        └── bookDepth/          ← 实时采集 CSV（非历史下载）
 ```
 
 ### 下载性能
@@ -327,7 +340,55 @@ BTC-Historical-Data/coinglass/
 
 ---
 
-## 7. 全部数据字段参考
+## 7. 实时采集——现货 bookDepth
+
+币安 data.binance.vision **不提供**历史现货 bookDepth 数据（仅合约有）。本脚本通过 WebSocket diff depth 流维护完整的现货本地订单簿，每 30 秒自动计算 ±1~5% 范围内的聚合深度，输出格式与合约 bookDepth 完全一致。
+
+### 工作原理
+
+1. 连接 `wss://stream.binance.com:9443/ws/btcusdt@depth@100ms`（100ms 推送频率）
+2. 从 REST API `/api/v3/depth?limit=5000` 获取初始订单簿快照
+3. 按 Binance 7 步同步算法将 WebSocket 增量事件应用到本地订单簿
+4. 每 30 秒计算中间价，将所有挂单按 ±1/2/3/4/5% 百分比范围聚合
+5. 输出与合约 bookDepth 相同的 CSV 格式
+
+### 使用方法
+
+```bash
+# 持续采集（Ctrl+C 停止）
+python3 scripts/collect_spot_bookdepth.py
+
+# 指定采集时长（秒）
+python3 scripts/collect_spot_bookdepth.py --duration 86400   # 运行 24 小时
+
+# 自定义参数
+python3 scripts/collect_spot_bookdepth.py \
+  --symbol BTCUSDT \
+  --interval 30 \
+  --output ~/Desktop/BTC-Historical-Data/spot/BTCUSDT/bookDepth
+```
+
+### 输出格式
+
+```csv
+timestamp,percentage,depth,notional
+2026-03-02 07:27:35,-5,591.52743000,38296603.93248190
+2026-03-02 07:27:35,-4,453.98524000,29630035.40548190
+2026-03-02 07:27:35,-3,453.18459000,29578993.96798190
+2026-03-02 07:27:35,-2,453.18459000,29578993.96798190
+2026-03-02 07:27:35,-1,196.10205000,12866369.08222965
+2026-03-02 07:27:35,1,246.70092000,16259912.67587841
+2026-03-02 07:27:35,2,264.94824000,17475580.98836712
+2026-03-02 07:27:35,3,264.94824000,17475580.98836712
+2026-03-02 07:27:35,4,264.94850000,17475598.62472672
+2026-03-02 07:27:35,5,264.94850000,17475598.62472672
+```
+
+> **注意**: 采集器启动后需要约 1-2 分钟让 WebSocket 增量流填充足够的价格档位，之后 ±5% 范围的数据会逐步完善。文件按日期自动轮转。
+
+---
+
+## 8. 全部数据字段参考
 
 ### 7.1 实时采集——快照文件（`snapshots_*.parquet`）
 
@@ -468,9 +529,9 @@ BTC-Historical-Data/coinglass/
 
 ---
 
-## 8. 回溯研究使用指南
+## 9. 回溯研究使用指南
 
-### 8.1 订单簿重建（快照 + 事件回放）
+### 9.1 订单簿重建（快照 + 事件回放）
 
 ```python
 import pandas as pd
@@ -508,7 +569,7 @@ for _, row in events.iterrows():
     # 此处可记录中间价、价差等指标
 ```
 
-### 8.2 DuckDB 快速分析
+### 9.2 DuckDB 快速分析
 
 ```sql
 -- 1 秒粒度中间价时间序列
@@ -526,7 +587,7 @@ WHERE is_buyer_maker = false  -- 买方主动成交
 ORDER BY transact_time LIMIT 100;
 ```
 
-### 8.3 利用检查点跨越长历史
+### 9.3 利用检查点跨越长历史
 
 ```python
 # 找到目标时刻之前最近的检查点
@@ -537,7 +598,7 @@ seed = snaps[snaps["snapshot_time_ns"] <= target_ns].iloc[-1]
 
 ---
 
-## 9. 配置说明
+## 10. 配置说明
 
 ### `config/symbols.yaml`
 
@@ -561,7 +622,7 @@ futures:
 
 ---
 
-## 10. TimescaleDB 监控（可选）
+## 11. TimescaleDB 监控（可选）
 
 ```bash
 docker compose up -d
@@ -578,7 +639,7 @@ python -m src.main
 
 ---
 
-## 11. 系统要求与存储估算
+## 12. 系统要求与存储估算
 
 ### 实时采集
 
@@ -604,7 +665,7 @@ python -m src.main
 
 ---
 
-## 12. 已知限制
+## 13. 已知限制
 
 | 限制 | 说明 |
 |------|------|
@@ -613,11 +674,12 @@ python -m src.main
 | **实时采集无回填** | 只能采集启动后的数据，历史数据需使用下载工具 |
 | **24h 强制重连** | Binance 每 24h 断开 WS，系统在 23h50m 主动重连（~1-3 秒暂停） |
 | **CoinGlass 间隔限制** | 付费套餐最小 30m（90 天），免费 1h（180 天），5m/1m 需更高套餐 |
-| **Binance bookDepth** | 仅合约可用，仅 ±1-5% 汇总，非逐档位 |
+| **Binance 合约 bookDepth** | data.binance.vision 仅合约可用，±1-5% 汇总，非逐档位 |
+| **现货 bookDepth 无历史** | 币安不提供历史现货 bookDepth，需通过 `collect_spot_bookdepth.py` 实时采集 |
 
 ---
 
-## 13. 常见问题排查
+## 14. 常见问题排查
 
 | 问题 | 原因 | 解决方案 |
 |------|------|---------|
@@ -648,6 +710,7 @@ Binance-BTC-Orderbook-Data/
 ├── scripts/
 │   ├── download_historical.py           # Binance 历史数据批量下载
 │   ├── download_coinglass_orderbook.py  # CoinGlass Order Book 深度下载
+│   ├── collect_spot_bookdepth.py       # 现货 bookDepth 实时采集（WebSocket）
 │   ├── generate_sample.py              # 样本采集 + 自动验证
 │   ├── parquet_to_csv.py               # Parquet → CSV 转换
 │   └── init_db.sql                     # TimescaleDB 表结构

@@ -4,7 +4,7 @@ Download historical BTC data from Binance public data portal (data.binance.visio
 
 Available data for the requested period:
   - Futures: bookDepth (aggregated depth), aggTrades, trades, metrics
-  - Spot: aggTrades, trades
+  - Spot: aggTrades, trades, klines (1m, 5m, 30m, 1h)
 
 Output directory: ~/Desktop/BTC-Historical-Data/
 
@@ -42,7 +42,20 @@ DOWNLOAD_TASKS = [
     ("futures", "futures/um", "metrics", "BTCUSDT", "{sym}-metrics-{d}.zip"),
     ("spot", "spot", "aggTrades", "BTCUSDT", "{sym}-aggTrades-{d}.zip"),
     ("spot", "spot", "trades", "BTCUSDT", "{sym}-trades-{d}.zip"),
+    # Klines use a different URL pattern: .../klines/BTCUSDT/<interval>/filename
+    ("spot", "spot", "klines_1m", "BTCUSDT", "{sym}-1m-{d}.zip"),
+    ("spot", "spot", "klines_5m", "BTCUSDT", "{sym}-5m-{d}.zip"),
+    ("spot", "spot", "klines_30m", "BTCUSDT", "{sym}-30m-{d}.zip"),
+    ("spot", "spot", "klines_1h", "BTCUSDT", "{sym}-1h-{d}.zip"),
 ]
+
+# Map dtype to actual URL path for klines (different URL structure on data.binance.vision)
+KLINES_URL_MAP = {
+    "klines_1m": "klines/BTCUSDT/1m",
+    "klines_5m": "klines/BTCUSDT/5m",
+    "klines_30m": "klines/BTCUSDT/30m",
+    "klines_1h": "klines/BTCUSDT/1h",
+}
 
 MAX_CONCURRENT = 8
 
@@ -155,7 +168,12 @@ async def run_downloads(
                 for d in batch_dates:
                     date_str = d.strftime("%Y-%m-%d")
                     filename = tpl.format(sym=sym, d=date_str)
-                    url = f"{BASE_URL}/{category}/daily/{dtype}/{sym}/{filename}"
+                    # Klines have a different URL structure (sym already in path)
+                    url_dtype = KLINES_URL_MAP.get(dtype, dtype)
+                    if dtype in KLINES_URL_MAP:
+                        url = f"{BASE_URL}/{category}/daily/{url_dtype}/{filename}"
+                    else:
+                        url = f"{BASE_URL}/{category}/daily/{url_dtype}/{sym}/{filename}"
                     dest = dest_dir / filename
 
                     if dest.exists():
