@@ -2,14 +2,15 @@
 """
 Download BTC Order Book historical depth data from CoinGlass API.
 
-Data type: Aggregated bid/ask volume at ±X% from mid price (1h interval).
+Data type: Aggregated bid/ask volume at ±X% from mid price (30m default, configurable).
 Available for both Binance Spot and Futures, plus cross-exchange aggregated.
 
 Output: CSV files saved to ~/Desktop/BTC-Historical-Data/coinglass/
 
 Usage:
-    python scripts/download_coinglass_orderbook.py
-    python scripts/download_coinglass_orderbook.py --start 2026-01-01 --end 2026-03-01
+    python scripts/download_coinglass_orderbook.py --api-key YOUR_KEY
+    python scripts/download_coinglass_orderbook.py --api-key YOUR_KEY --interval 30m
+    python scripts/download_coinglass_orderbook.py --api-key YOUR_KEY --start 2026-01-01 --end 2026-03-01
 """
 
 import argparse
@@ -131,6 +132,7 @@ async def download_all(
     output_dir: Path,
     start_dt: datetime,
     end_dt: datetime,
+    interval: str = "30m",
 ):
     """Download all order book depth data from CoinGlass."""
     start_ms = int(start_dt.timestamp() * 1000)
@@ -140,7 +142,7 @@ async def download_all(
     log.info("CoinGlass Order Book Depth Downloader")
     log.info("=" * 60)
     log.info("Period: %s to %s", start_dt.date(), end_dt.date())
-    log.info("Interval: 1h")
+    log.info("Interval: %s", interval)
     log.info("Ranges: ±%s%%", ", ±".join(str(r) for r in RANGES))
     log.info("Data types: %d × %d ranges = %d API calls", len(TASKS), len(RANGES), len(TASKS) * len(RANGES))
     log.info("Output: %s", output_dir)
@@ -157,7 +159,7 @@ async def download_all(
             for range_val in RANGES:
                 params = {
                     **extra_params,
-                    "interval": "1h",
+                    "interval": interval,
                     "limit": MAX_LIMIT,
                     "range": range_val,
                 }
@@ -179,7 +181,7 @@ async def download_all(
                 )
 
                 if filtered:
-                    filename = f"{task_name}_range{range_val}pct_1h.csv"
+                    filename = f"{task_name}_range{range_val}pct_{interval}.csv"
                     filepath = output_dir / task_name / filename
                     write_csv(filepath, filtered, fields, range_val)
                     total_records += len(filtered)
@@ -195,11 +197,11 @@ async def download_all(
         if not task_dir.exists():
             continue
 
-        combined_path = output_dir / f"{task_name}_all_ranges_1h.csv"
+        combined_path = output_dir / f"{task_name}_all_ranges_{interval}.csv"
         all_rows = []
 
         for range_val in RANGES:
-            csv_file = task_dir / f"{task_name}_range{range_val}pct_1h.csv"
+            csv_file = task_dir / f"{task_name}_range{range_val}pct_{interval}.csv"
             if csv_file.exists():
                 with csv_file.open() as f:
                     reader = csv.reader(f)
@@ -231,6 +233,7 @@ def main():
     )
     parser.add_argument("--start", default="2026-01-01", help="Start date (inclusive)")
     parser.add_argument("--end", default="2026-03-01", help="End date (exclusive)")
+    parser.add_argument("--interval", default="30m", help="Data interval: 30m, 1h, 2h, 4h, 12h, 1d")
     parser.add_argument(
         "--output",
         default=str(Path.home() / "Desktop" / "BTC-Historical-Data" / "coinglass"),
@@ -247,7 +250,7 @@ def main():
     end_dt = datetime.fromisoformat(args.end).replace(tzinfo=timezone.utc)
     output_dir = Path(args.output)
 
-    asyncio.run(download_all(args.api_key, output_dir, start_dt, end_dt))
+    asyncio.run(download_all(args.api_key, output_dir, start_dt, end_dt, args.interval))
 
 
 if __name__ == "__main__":
